@@ -36,6 +36,7 @@
 #include "core/io/http_client.h"
 #include "core/io/json.h"
 #include "core/os/os.h"
+#include "core/os/time.h"
 #include "editor/docks/editor_dock.h"
 #include "editor/docks/editor_dock_manager.h"
 #include "editor/editor_node.h"
@@ -52,23 +53,56 @@
 
 static constexpr int MAX_TOOL_ROUNDS = 12;
 static constexpr uint64_t MAX_FILE_SIZE = 1024 * 1024;
+static constexpr uint64_t CODEX_TIMEOUT_MSEC = 15 * 60 * 1000;
+
+void AIAssistantPlugin::_notification(int p_what) {
+	if (p_what == NOTIFICATION_PROCESS && !codex_process.is_empty()) {
+		_poll_codex();
+	}
+}
 
 void AIAssistantPlugin::_append_message(const String &p_role, const String &p_text) {
 	transcript->append_text("[b]" + p_role.xml_escape() + ":[/b] " + p_text.xml_escape() + "\n\n");
 	transcript->scroll_to_line(transcript->get_line_count());
+	const String history_path = "user://ai_assistant_history.jsonl";
+	const FileAccess::ModeFlags mode = FileAccess::exists(history_path) ? FileAccess::READ_WRITE : FileAccess::WRITE_READ;
+	Ref<FileAccess> history = FileAccess::open(history_path, mode);
+	if (history.is_valid()) {
+		history->seek_end();
+		history->store_line(JSON::stringify(Dictionary{ { "time", Time::get_singleton()->get_datetime_string_from_system(true) }, { "role", p_role }, { "text", p_text } }));
+	}
+}
+
+void AIAssistantPlugin::_load_history() {
+	Ref<FileAccess> history = FileAccess::open("user://ai_assistant_history.jsonl", FileAccess::READ);
+	if (history.is_null()) {
+		return;
+	}
+	while (!history->eof_reached()) {
+		const Variant entry_variant = JSON::parse_string(history->get_line());
+		if (entry_variant.get_type() != Variant::DICTIONARY) {
+			continue;
+		}
+		const Dictionary entry = entry_variant;
+		transcript->append_text("[color=gray]" + String(entry.get("time", "")).xml_escape() + "[/color] [b]" + String(entry.get("role", "")).xml_escape() + ":[/b] " + String(entry.get("text", "")).xml_escape() + "\n\n");
+	}
 }
 
 void AIAssistantPlugin::_set_busy(bool p_busy) {
 	busy = p_busy;
 	send_button->set_disabled(p_busy);
-	stop_button->set_disabled(!p_busy || provider->get_selected_id() == 1);
+	stop_button->set_disabled(!p_busy);
 	prompt->set_editable(!p_busy);
+	if (apply_button) {
+		_update_staging_controls();
+	}
 }
 
 void AIAssistantPlugin::_provider_changed(int p_index) {
 	const bool use_api = provider->get_item_id(p_index) == 0;
 	api_key->set_visible(use_api);
 	api_key->set_editable(use_api);
+	codex_path->set_visible(!use_api);
 	model->set_placeholder(use_api ? TTRC("API model") : TTRC("Codex model (optional)"));
 	if (use_api && model->get_text().is_empty()) {
 		model->set_text("gpt-5.4");
@@ -85,6 +119,19 @@ String AIAssistantPlugin::_safe_project_path(const String &p_path) const {
 	path = path.simplify_path();
 	if (path.is_empty() || path.is_absolute_path() || path == ".." || path.begins_with("../") || path.contains("/../")) {
 		return String();
+	}
+	Ref<DirAccess> directory = DirAccess::open("res://");
+	if (directory.is_null()) {
+		return String();
+	}
+	const PackedStringArray components = path.split("/", false);
+	for (int i = 0; i < components.size(); i++) {
+		if (directory->is_link(components[i])) {
+			return String();
+		}
+		if (i + 1 < components.size() && directory->dir_exists(components[i]) && directory->change_dir(components[i]) != OK) {
+			return String();
+		}
 	}
 	return "res://" + path;
 }
@@ -121,25 +168,140 @@ Dictionary AIAssistantPlugin::_write_file(const String &p_path, const String &p_
 		result["error"] = "Content is larger than the 1 MiB assistant limit.";
 		return result;
 	}
-	const String base_dir = path.get_base_dir();
-	if (!DirAccess::dir_exists_absolute(base_dir)) {
-		const Error mkdir_error = DirAccess::make_dir_recursive_absolute(base_dir);
-		if (mkdir_error != OK) {
-			result["error"] = "Unable to create directory " + base_dir + ".";
-			return result;
+	staged_files[path] = p_content;
+	result["path"] = path;
+	result["bytes_staged"] = p_content.to_utf8_buffer().size();
+	result["status"] = "staged_for_user_review";
+	_append_message(TTR("Tool"), vformat(TTR("Staged %d bytes for %s"), (int)result["bytes_staged"], path));
+	_update_staging_controls();
+	return result;
+}
+
+void AIAssistantPlugin::_update_staging_controls() {
+	const bool has_staged = !staged_files.is_empty();
+	apply_button->set_disabled(!has_staged || busy);
+	discard_button->set_disabled(!has_staged || busy);
+	undo_button->set_disabled((rollback_files.is_empty() && rollback_created_files.is_empty()) || busy);
+	apply_button->set_text(has_staged ? vformat(TTR("Apply %d File(s)"), staged_files.size()) : TTR("Apply Changes"));
+}
+
+void AIAssistantPlugin::_discard_staged_files() {
+	const int count = staged_files.size();
+	staged_files.clear();
+	_append_message(TTR("System"), vformat(TTR("Discarded %d staged file(s)."), count));
+	_update_staging_controls();
+}
+
+String AIAssistantPlugin::_validate_staged_content(const String &p_path, const String &p_content) const {
+	if (p_content.contains_char('\0')) {
+		return TTR("Text files cannot contain NUL bytes.");
+	}
+	const String extension = p_path.get_extension().to_lower();
+	if (extension == "json" && JSON::parse_string(p_content).get_type() == Variant::NIL && p_content.strip_edges() != "null") {
+		return TTR("The generated JSON is invalid.");
+	}
+	if (extension == "tscn" && !p_content.strip_edges().begins_with("[gd_scene")) {
+		return TTR("A text scene must begin with a gd_scene header.");
+	}
+	if (extension == "tres" && !p_content.strip_edges().begins_with("[gd_resource")) {
+		return TTR("A text resource must begin with a gd_resource header.");
+	}
+	if (extension == "svg" && !p_content.contains("<svg")) {
+		return TTR("The generated SVG does not contain an svg root element.");
+	}
+	return String();
+}
+
+void AIAssistantPlugin::_apply_staged_files() {
+	if (busy || staged_files.is_empty()) {
+		return;
+	}
+	rollback_files.clear();
+	rollback_created_files.clear();
+	Vector<String> applied;
+	String failure;
+	for (const KeyValue<String, String> &entry : staged_files) {
+		const String path = entry.key;
+		const String validation_error = _validate_staged_content(path, entry.value);
+		if (!validation_error.is_empty()) {
+			failure = vformat(TTR("Validation failed for %s: %s"), path, validation_error);
+			break;
+		}
+		const String directory = path.get_base_dir();
+		if (!DirAccess::dir_exists_absolute(directory) && DirAccess::make_dir_recursive_absolute(directory) != OK) {
+			failure = vformat(TTR("Could not create %s."), directory);
+			break;
+		}
+		if (FileAccess::exists(path)) {
+			Ref<FileAccess> original = FileAccess::open(path, FileAccess::READ);
+			if (original.is_null()) {
+				failure = vformat(TTR("Could not back up %s."), path);
+				break;
+			}
+			rollback_files[path] = original->get_as_text();
+		} else {
+			rollback_created_files.insert(path);
+		}
+		const String temporary_path = path + ".ai_assistant_tmp";
+		Ref<FileAccess> temporary = FileAccess::open(temporary_path, FileAccess::WRITE);
+		if (temporary.is_null()) {
+			failure = vformat(TTR("Could not stage temporary file for %s."), path);
+			break;
+		}
+		temporary->store_string(entry.value);
+		temporary.unref();
+		if (FileAccess::exists(path) && DirAccess::remove_absolute(path) != OK) {
+			DirAccess::remove_absolute(temporary_path);
+			failure = vformat(TTR("Could not replace %s."), path);
+			break;
+		}
+		if (DirAccess::rename_absolute(temporary_path, path) != OK) {
+			if (rollback_files.has(path)) {
+				Ref<FileAccess> restored = FileAccess::open(path, FileAccess::WRITE);
+				if (restored.is_valid()) {
+					restored->store_string(rollback_files[path]);
+				}
+			}
+			failure = vformat(TTR("Could not move the staged file into %s."), path);
+			break;
+		}
+		applied.push_back(path);
+	}
+	if (!failure.is_empty()) {
+		for (const String &path : applied) {
+			if (rollback_created_files.has(path)) {
+				DirAccess::remove_absolute(path);
+			} else if (rollback_files.has(path)) {
+				Ref<FileAccess> restored = FileAccess::open(path, FileAccess::WRITE);
+				if (restored.is_valid()) {
+					restored->store_string(rollback_files[path]);
+				}
+			}
+		}
+		_append_message(TTR("Error"), failure + " " + TTR("Applied files were rolled back."));
+	} else {
+		_append_message(TTR("System"), vformat(TTR("Applied %d staged file(s). Use Undo Apply to restore them."), staged_files.size()));
+		staged_files.clear();
+		EditorFileSystem::get_singleton()->scan_changes();
+	}
+	_update_staging_controls();
+}
+
+void AIAssistantPlugin::_undo_last_apply() {
+	for (const String &path : rollback_created_files) {
+		DirAccess::remove_absolute(path);
+	}
+	for (const KeyValue<String, String> &entry : rollback_files) {
+		Ref<FileAccess> restored = FileAccess::open(entry.key, FileAccess::WRITE);
+		if (restored.is_valid()) {
+			restored->store_string(entry.value);
 		}
 	}
-	Ref<FileAccess> file = FileAccess::open(path, FileAccess::WRITE);
-	if (file.is_null()) {
-		result["error"] = "Unable to write " + path + ".";
-		return result;
-	}
-	file->store_string(p_content);
-	result["path"] = path;
-	result["bytes_written"] = p_content.to_utf8_buffer().size();
-	_append_message(TTR("Tool"), vformat(TTR("Wrote %d bytes to %s"), (int)result["bytes_written"], path));
+	rollback_files.clear();
+	rollback_created_files.clear();
 	EditorFileSystem::get_singleton()->scan_changes();
-	return result;
+	_append_message(TTR("System"), TTR("Restored files from before the last apply."));
+	_update_staging_controls();
 }
 
 Dictionary AIAssistantPlugin::_list_files(const String &p_path) const {
@@ -198,7 +360,7 @@ Array AIAssistantPlugin::_tool_definitions() const {
 	write_properties["path"] = Dictionary{ { "type", "string" }, { "description", "Path relative to res://" } };
 	write_properties["content"] = Dictionary{ { "type", "string" }, { "description", "Complete new UTF-8 file contents" } };
 	Dictionary write_parameters{ { "type", "object" }, { "properties", write_properties }, { "required", Array{ "path", "content" } }, { "additionalProperties", false } };
-	tools.push_back(Dictionary{ { "type", "function" }, { "name", "write_file" }, { "description", "Create or replace a text file in the Godot project. Read existing files before replacing them." }, { "parameters", write_parameters }, { "strict", true } });
+	tools.push_back(Dictionary{ { "type", "function" }, { "name", "write_file" }, { "description", "Stage a complete text file for user review. Read existing files before proposing replacements. Staged files are not written until the user approves them." }, { "parameters", write_parameters }, { "strict", true } });
 	return tools;
 }
 
@@ -230,13 +392,7 @@ void AIAssistantPlugin::_send_prompt() {
 	_set_busy(true);
 	if (provider->get_selected_id() == 1) {
 		_append_message(TTR("System"), TTR("Running Codex CLI using your local ChatGPT sign-in. Codex can edit this project directly."));
-		codex_prompt = text;
-		codex_model = model->get_text().strip_edges();
-		codex_thread.start(&AIAssistantPlugin::_codex_thread_callback, this);
-		if (!codex_thread.is_started()) {
-			_append_message(TTR("Error"), TTR("Could not start the Codex worker thread."));
-			_set_busy(false);
-		}
+		_start_codex(text);
 		return;
 	}
 
@@ -248,11 +404,7 @@ void AIAssistantPlugin::_send_prompt() {
 	_start_request(payload);
 }
 
-void AIAssistantPlugin::_codex_thread_callback(void *p_userdata) {
-	static_cast<AIAssistantPlugin *>(p_userdata)->_run_codex();
-}
-
-void AIAssistantPlugin::_run_codex() {
+void AIAssistantPlugin::_start_codex(const String &p_prompt) {
 	List<String> arguments;
 	arguments.push_back("exec");
 	arguments.push_back("--full-auto");
@@ -261,35 +413,76 @@ void AIAssistantPlugin::_run_codex() {
 	arguments.push_back("never");
 	arguments.push_back("-C");
 	arguments.push_back(ProjectSettings::get_singleton()->globalize_path("res://"));
-	if (!codex_model.is_empty()) {
+	const String selected_model = model->get_text().strip_edges();
+	if (!selected_model.is_empty()) {
 		arguments.push_back("--model");
-		arguments.push_back(codex_model);
+		arguments.push_back(selected_model);
 	}
-	arguments.push_back(codex_prompt);
-
-	String output;
-	int exit_code = -1;
-	const Error error = OS::get_singleton()->execute("codex", arguments, &output, &exit_code, true);
-	callable_mp(this, &AIAssistantPlugin::_codex_finished).call_deferred(output, exit_code, error);
+	arguments.push_back(p_prompt);
+	codex_output.clear();
+	codex_process = OS::get_singleton()->execute_with_pipe(codex_path->get_text().strip_edges(), arguments, false);
+	if (!codex_process.has("pid") || (int)codex_process["pid"] <= 0) {
+		codex_process.clear();
+		_append_message(TTR("Error"), TTR("Could not launch Codex CLI. Configure your PATH, install Codex, and run `codex login`."));
+		_set_busy(false);
+		return;
+	}
+	codex_started_at = OS::get_singleton()->get_ticks_msec();
 }
 
-void AIAssistantPlugin::_codex_finished(const String &p_output, int p_exit_code, Error p_error) {
-	if (codex_thread.is_started()) {
-		codex_thread.wait_to_finish();
+void AIAssistantPlugin::_poll_codex() {
+	const int64_t pid = codex_process["pid"];
+	for (const char *stream_name : { "stdio", "stderr" }) {
+		const String stream_key = stream_name;
+		Ref<FileAccess> stream = codex_process.get(stream_key, Ref<FileAccess>());
+		if (stream.is_valid() && stream->is_open()) {
+			const uint64_t available = stream->get_length();
+			if (available > 0) {
+				PackedByteArray bytes;
+				bytes.resize(MIN(available, uint64_t(64 * 1024)));
+				const uint64_t read = stream->get_buffer(bytes.ptrw(), bytes.size());
+				const String chunk = String::utf8(reinterpret_cast<const char *>(bytes.ptr()), read);
+				codex_output += chunk;
+				_append_message(stream_key == "stderr" ? TTR("Codex error") : TTR("Codex"), chunk.strip_edges());
+			}
+		}
 	}
-	if (p_error != OK) {
-		_append_message(TTR("Error"), TTR("Could not launch Codex CLI. Install Codex, run `codex login`, and make sure `codex` is available on PATH."));
-	} else if (p_exit_code != 0) {
-		_append_message(TTR("Error"), vformat(TTR("Codex exited with code %d:\n%s"), p_exit_code, p_output));
-	} else {
-		_append_message(TTR("Codex"), p_output.strip_edges().is_empty() ? TTR("Finished editing the project.") : p_output.strip_edges());
+	if (OS::get_singleton()->get_ticks_msec() - codex_started_at > CODEX_TIMEOUT_MSEC) {
+		OS::get_singleton()->kill(pid);
+		_append_message(TTR("Error"), TTR("Codex was stopped after the 15 minute execution limit."));
+		codex_process.clear();
+		_set_busy(false);
+		return;
+	}
+	if (!OS::get_singleton()->is_process_running(pid)) {
+		const int exit_code = OS::get_singleton()->get_process_exit_code(pid);
+		codex_process.clear();
+		_finish_codex(exit_code);
+	}
+}
+
+void AIAssistantPlugin::_finish_codex(int p_exit_code) {
+	if (p_exit_code == 0) {
 		EditorFileSystem::get_singleton()->scan_changes();
+		_append_message(TTR("System"), TTR("Codex finished. Review all project changes in version control."));
+	} else {
+		_append_message(TTR("Error"), vformat(TTR("Codex exited with code %d."), p_exit_code));
 	}
 	_set_busy(false);
 }
 
 void AIAssistantPlugin::_stop() {
 	if (!busy) {
+		return;
+	}
+	if (!codex_process.is_empty()) {
+		const int64_t pid = codex_process["pid"];
+		if (OS::get_singleton()->is_process_running(pid)) {
+			OS::get_singleton()->kill(pid);
+		}
+		codex_process.clear();
+		_set_busy(false);
+		_append_message(TTR("System"), TTR("Codex process stopped."));
 		return;
 	}
 	request->cancel_request();
@@ -322,11 +515,20 @@ void AIAssistantPlugin::_request_completed(int p_result, int p_response_code, co
 		return;
 	}
 	Dictionary response = parsed;
+	const String status = response.get("status", "");
+	if (status == "failed" || status == "cancelled" || status == "incomplete") {
+		_append_message(TTR("Error"), vformat(TTR("OpenAI response ended with status '%s'. No staged changes were applied."), status));
+		_set_busy(false);
+		return;
+	}
 	previous_response_id = response.get("id", "");
 	Array outputs = response.get("output", Array());
 	Array tool_outputs;
 	String answer;
 	for (const Variant &output_variant : outputs) {
+		if (output_variant.get_type() != Variant::DICTIONARY) {
+			continue;
+		}
 		Dictionary output = output_variant;
 		const String type = output.get("type", "");
 		if (type == "function_call") {
@@ -340,6 +542,9 @@ void AIAssistantPlugin::_request_completed(int p_result, int p_response_code, co
 		} else if (type == "message") {
 			Array content = output.get("content", Array());
 			for (const Variant &content_variant : content) {
+				if (content_variant.get_type() != Variant::DICTIONARY) {
+					continue;
+				}
 				Dictionary part = content_variant;
 				if (part.get("type", "") == "output_text") {
 					answer += String(part.get("text", ""));
@@ -397,6 +602,11 @@ AIAssistantPlugin::AIAssistantPlugin() {
 	api_key->set_secret(true);
 	api_key->set_text(OS::get_singleton()->get_environment("OPENAI_API_KEY"));
 	root->add_child(api_key);
+	codex_path = memnew(LineEdit);
+	codex_path->set_placeholder(TTRC("Path to Codex executable"));
+	codex_path->set_text("codex");
+	codex_path->set_tooltip_text(TTRC("Use an absolute path if Godot does not inherit your shell PATH."));
+	root->add_child(codex_path);
 
 	model = memnew(LineEdit);
 	model->set_placeholder(TTRC("Model"));
@@ -409,6 +619,7 @@ AIAssistantPlugin::AIAssistantPlugin() {
 	transcript->set_v_size_flags(Control::SIZE_EXPAND_FILL);
 	transcript->set_custom_minimum_size(Size2(280, 180) * EDSCALE);
 	root->add_child(transcript);
+	_load_history();
 
 	prompt = memnew(TextEdit);
 	prompt->set_placeholder(TTRC("Describe what you want to build or change…"));
@@ -427,18 +638,37 @@ AIAssistantPlugin::AIAssistantPlugin() {
 	stop_button->connect(SceneStringName(pressed), callable_mp(this, &AIAssistantPlugin::_stop));
 	actions->add_child(stop_button);
 
+	HBoxContainer *review_actions = memnew(HBoxContainer);
+	root->add_child(review_actions);
+	apply_button = memnew(Button(TTRC("Apply Changes")));
+	apply_button->set_disabled(true);
+	apply_button->connect(SceneStringName(pressed), callable_mp(this, &AIAssistantPlugin::_apply_staged_files));
+	review_actions->add_child(apply_button);
+	discard_button = memnew(Button(TTRC("Discard")));
+	discard_button->set_disabled(true);
+	discard_button->connect(SceneStringName(pressed), callable_mp(this, &AIAssistantPlugin::_discard_staged_files));
+	review_actions->add_child(discard_button);
+	undo_button = memnew(Button(TTRC("Undo Apply")));
+	undo_button->set_disabled(true);
+	undo_button->connect(SceneStringName(pressed), callable_mp(this, &AIAssistantPlugin::_undo_last_apply));
+	review_actions->add_child(undo_button);
+
 	request = memnew(HTTPRequest);
 	request->set_timeout(120);
 	request->set_body_size_limit(8 * 1024 * 1024);
 	request->connect("request_completed", callable_mp(this, &AIAssistantPlugin::_request_completed));
 	add_child(request);
+	set_process(true);
 
 	EditorDockManager::get_singleton()->add_dock(dock);
 }
 
 AIAssistantPlugin::~AIAssistantPlugin() {
-	if (codex_thread.is_started()) {
-		codex_thread.wait_to_finish();
+	if (!codex_process.is_empty()) {
+		const int64_t pid = codex_process["pid"];
+		if (OS::get_singleton()->is_process_running(pid)) {
+			OS::get_singleton()->kill(pid);
+		}
 	}
 	if (dock) {
 		EditorDockManager::get_singleton()->remove_dock(dock);

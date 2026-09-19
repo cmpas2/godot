@@ -30,7 +30,8 @@
 
 #pragma once
 
-#include "core/os/thread.h"
+#include "core/templates/hash_map.h"
+#include "core/templates/hash_set.h"
 #include "editor/plugins/editor_plugin.h"
 
 class Button;
@@ -48,25 +49,38 @@ class AIAssistantPlugin : public EditorPlugin {
 	HTTPRequest *request = nullptr;
 	LineEdit *api_key = nullptr;
 	LineEdit *model = nullptr;
+	LineEdit *codex_path = nullptr;
 	OptionButton *provider = nullptr;
 	RichTextLabel *transcript = nullptr;
 	TextEdit *prompt = nullptr;
 	Button *send_button = nullptr;
 	Button *stop_button = nullptr;
+	Button *apply_button = nullptr;
+	Button *discard_button = nullptr;
+	Button *undo_button = nullptr;
 
 	String previous_response_id;
 	int tool_rounds = 0;
 	bool busy = false;
-	Thread codex_thread;
-	String codex_prompt;
-	String codex_model;
+	Dictionary codex_process;
+	String codex_output;
+	uint64_t codex_started_at = 0;
+	HashMap<String, String> staged_files;
+	HashMap<String, String> rollback_files;
+	HashSet<String> rollback_created_files;
 
 	void _provider_changed(int p_index);
 	void _send_prompt();
-	static void _codex_thread_callback(void *p_userdata);
-	void _run_codex();
-	void _codex_finished(const String &p_output, int p_exit_code, Error p_error);
+	void _start_codex(const String &p_prompt);
+	void _poll_codex();
+	void _finish_codex(int p_exit_code);
 	void _stop();
+	void _apply_staged_files();
+	void _discard_staged_files();
+	void _undo_last_apply();
+	void _update_staging_controls();
+	void _load_history();
+	String _validate_staged_content(const String &p_path, const String &p_content) const;
 	void _request_completed(int p_result, int p_response_code, const PackedStringArray &p_headers, const PackedByteArray &p_body);
 	Error _start_request(const Dictionary &p_payload);
 	Array _tool_definitions() const;
@@ -77,6 +91,9 @@ class AIAssistantPlugin : public EditorPlugin {
 	String _safe_project_path(const String &p_path) const;
 	void _append_message(const String &p_role, const String &p_text);
 	void _set_busy(bool p_busy);
+
+protected:
+	void _notification(int p_what);
 
 public:
 	virtual String get_plugin_name() const override { return "AI Assistant"; }
