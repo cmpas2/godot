@@ -36,6 +36,7 @@
 #include "core/object/class_db.h"
 #include "core/object/script_language.h"
 #include "core/os/os.h"
+#include "editor/ai_assistant/ai_assistant_plugin.h"
 #include "editor/animation/animation_tree_editor_plugin.h"
 #include "editor/audio/audio_stream_randomizer_editor_plugin.h"
 #include "editor/debugger/debug_adapter/debug_adapter_server.h"
@@ -225,6 +226,7 @@ void register_editor_types() {
 	GDREGISTER_CLASS(ResourceImporterStreamedTexture);
 
 	// This list is alphabetized, and plugins that depend on Node2D or Node3D are in their own section below.
+	EditorPlugins::add_by_type<AIAssistantPlugin>();
 	EditorPlugins::add_by_type<AnimationTreeEditorPlugin>();
 	EditorPlugins::add_by_type<AudioStreamRandomizerEditorPlugin>();
 	EditorPlugins::add_by_type<BitMapEditorPlugin>();
